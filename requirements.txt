@@ -1,0 +1,8 @@
+google-cloud-firestore
+streamlit
+scikit-learn
+numpy
+pandas
+transformers~=4.49.0
+openai~=0.28.0
+protobuf~=5.29.1
