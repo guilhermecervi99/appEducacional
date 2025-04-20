@@ -1,19 +1,21 @@
 # app/llm_integration.py
 import os
-import openai
+from openai import OpenAI
+
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 import json
+import time
+import hashlib
 from typing import Dict, List, Optional, Union, Any
+from collections import OrderedDict
 
 # Configuração da API
-openai.api_key = os.environ.get("OPENAI_API_KEY")
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 
 # Modelos disponíveis
 MODELS = {
     "default": "gpt-4o",
     "fast": "gpt-3.5-turbo",
-    "advanced": "gpt-4o",
-    "deepseek": "deepseek-chat"  # Modelo alternativo caso deseje implementar
+    "advanced": "gpt-4o"
 }
 
 # Estilos de ensino disponíveis
@@ -26,8 +28,41 @@ TEACHING_STYLES = {
     "projeto": "Aprendizado baseado em projetos práticos aplicáveis"
 }
 
-# Cache simples para evitar chamadas repetidas à API
-_response_cache = {}
+
+# Sistema de cache com limite de tamanho
+class LRUCache:
+    """Cache LRU (Least Recently Used) com limite de tamanho."""
+
+    def __init__(self, max_size=1000):
+        self.cache = OrderedDict()
+        self.max_size = max_size
+
+    def get(self, key):
+        if key in self.cache:
+            # Mover para o fim (mais recentemente usado)
+            value = self.cache.pop(key)
+            self.cache[key] = value
+            return value
+        return None
+
+    def set(self, key, value):
+        if key in self.cache:
+            # Remover para atualizar a posição
+            self.cache.pop(key)
+        elif len(self.cache) >= self.max_size:
+            # Remover o item menos recentemente usado
+            self.cache.popitem(last=False)
+
+        # Adicionar ao final (mais recentemente usado)
+        self.cache[key] = value
+
+
+# Cache para respostas de LLM
+# Chave: hash do prompt e parâmetros, Valor: (resposta, timestamp)
+_response_cache = LRUCache(max_size=1000)
+
+# Tempo máximo de cache (24 horas)
+CACHE_TTL = 24 * 60 * 60  # em segundos
 
 
 class LessonContent:
@@ -92,6 +127,22 @@ class LessonContent:
         )
 
 
+def get_cache_key(content: str, **kwargs) -> str:
+    """
+    Gera uma chave de cache única baseada no conteúdo e parâmetros.
+    """
+    # Criar uma representação estável dos parâmetros
+    params_str = json.dumps(
+        {k: v for k, v in sorted(kwargs.items()) if k not in ['user_id', 'use_cache']}
+    )
+
+    # Concatenar conteúdo e parâmetros
+    combined = f"{content}::{params_str}"
+
+    # Gerar hash
+    return hashlib.md5(combined.encode('utf-8')).hexdigest()
+
+
 def call_teacher_llm(user_content: str,
                      student_age: Union[int, List[int]] = None,
                      subject_area: str = None,
@@ -129,9 +180,22 @@ def call_teacher_llm(user_content: str,
         age_range = "11-17"  # Padrão
 
     # Verificar cache se habilitado
-    cache_key = f"{user_content}:{subject_area}:{teaching_style}:{knowledge_level}:{age_range}:{model}"
-    if use_cache and cache_key in _response_cache:
-        return _response_cache[cache_key]
+    if use_cache:
+        cache_key = get_cache_key(
+            user_content,
+            student_age=age_range,
+            subject_area=subject_area,
+            teaching_style=teaching_style,
+            knowledge_level=knowledge_level,
+            model=model
+        )
+        cached = _response_cache.get(cache_key)
+
+        if cached:
+            response, timestamp = cached
+            # Verificar se o cache ainda é válido
+            if time.time() - timestamp < CACHE_TTL:
+                return response
 
     # Construir o prompt do sistema
     system_prompt = (
@@ -186,25 +250,20 @@ def call_teacher_llm(user_content: str,
         {"role": "user", "content": user_content}
     ]
 
-    # Se temos ID de usuário e histórico de interações anteriores, poderíamos adicionar aqui
-    # para criar uma experiência mais personalizada ao longo do tempo
-
     # Selecionar o modelo apropriado
     selected_model = MODELS.get(model, MODELS["default"])
 
     # Realizar a chamada à API
     try:
-        response = openai.ChatCompletion.create(
-            model=selected_model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
+        response = client.chat.completions.create(model=selected_model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens)
         content = response.choices[0].message.content
 
         # Guardar no cache se habilitado
         if use_cache:
-            _response_cache[cache_key] = content
+            _response_cache.set(cache_key, (content, time.time()))
 
         return content
     except Exception as e:
